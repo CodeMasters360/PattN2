@@ -195,7 +195,7 @@ jobs:
           7z a -tZip "PattN-windows-64.zip" "PattN-windows-64" -mx1
 
       - name: Publish to GitHub Release
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@v3
         with:
           tag_name: latest
           name: "Latest Automated Build (Windows x64)"
