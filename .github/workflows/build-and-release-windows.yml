@@ -1,0 +1,210 @@
+name: Build and Release Windows x64
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - master
+  schedule:
+    - cron: '0 2 * * *'
+
+permissions:
+  contents: write
+
+jobs:
+  # -------------------------------------------------------------
+  # مرحله اول: کامپایل Aether از سورس (Rust + Go)
+  # -------------------------------------------------------------
+  build-aether:
+    name: Build Aether Core from Source
+    runs-on: windows-latest
+    steps:
+      - name: Checkout Aether Source
+        uses: actions/checkout@v4
+        with:
+          repository: patterniha/Aether
+          path: aether-src
+          submodules: recursive
+          fetch-depth: 0
+
+      - name: Install Rust Toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-msvc
+
+      - name: Install Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.22'
+
+      - name: Install CMake & Ninja
+        uses: lukka/get-cmake@latest
+
+      - name: Install NASM
+        uses: ilammy/setup-nasm@v1
+
+      - name: Build Pluggable Transports & Psiphon
+        shell: bash
+        working-directory: aether-src/aether
+        run: |
+          mkdir -p pt LICENSES
+          bash ../pt-build.sh windows amd64 "$PWD/pt" "" "$PWD/LICENSES"
+          bash ../psiphon-build.sh windows amd64 "$PWD/pt" "" "$PWD/LICENSES"
+
+      - name: Build Aether Release Binary
+        working-directory: aether-src/aether
+        run: cargo build --release --features tor --target x86_64-pc-windows-msvc
+
+      - name: Collect Licenses and Metadata
+        shell: bash
+        working-directory: aether-src/aether
+        run: |
+          cp ../LICENSE LICENSES/aether-LICENSE.txt
+          python ../third-party-notices.py --target x86_64-pc-windows-msvc --features tor --output LICENSES/THIRD-PARTY-NOTICES.txt
+
+      - name: Stage Aether Binaries
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path aether-bin/bin/aether | Out-Null
+          Copy-Item aether-src/aether/target/x86_64-pc-windows-msvc/release/aether.exe aether-bin/bin/aether/ -Force
+          Copy-Item aether-src/aether/pt/*.exe aether-bin/bin/aether/ -Force
+          Copy-Item -Recurse aether-src/aether/LICENSES aether-bin/bin/aether/LICENSES -Force
+
+      - name: Upload Aether Built Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: aether-windows-bin
+          path: aether-bin/
+          if-no-files-found: error
+
+  # -------------------------------------------------------------
+  # مرحله دوم: کامپایل سورس PattN، تجمیع هسته‌ها و ساخت پکیج
+  # -------------------------------------------------------------
+  build-and-package:
+    name: Build & Package Windows x64
+    needs: build-aether
+    runs-on: windows-latest
+    env:
+      DOTNET_CLI_TELEMETRY_OPTOUT: true
+      DOTNET_NOLOGO: true
+
+    steps:
+      - name: Checkout PattN Upstream Source
+        uses: actions/checkout@v7
+        with:
+          repository: patterniha/PattN
+          submodules: 'recursive'
+          fetch-depth: '0'
+
+      - name: Purge Pre-installed SDKs
+        shell: pwsh
+        run: |
+          dotnet --list-sdks | ForEach-Object {
+            if ($_ -match '^\S+\s+\[(.+)\]$') {
+              $d = Join-Path $Matches[1] $_.Split()[0]
+              Write-Host "Removing $d"
+              Remove-Item $d -Recurse -Force -ErrorAction SilentlyContinue
+            }
+          }
+          dotnet --list-sdks 2>$null
+          $LASTEXITCODE = 0
+
+      - name: Setup .NET SDK
+        uses: actions/setup-dotnet@v6
+        with:
+          dotnet-version: 10.0.x
+
+      - name: Build AmazTool
+        shell: bash
+        working-directory: ./v2rayN
+        run: |
+          dotnet publish ./AmazTool/AmazTool.csproj \
+            -c Release \
+            -r win-x64 \
+            -p:SelfContained=true \
+            -p:PublishTrimmed=true \
+            -p:EnableWindowsTargeting=true \
+            -o "${GITHUB_WORKSPACE}/PattN-windows-64"
+
+      - name: Build v2rayN WPF
+        shell: bash
+        working-directory: ./v2rayN
+        run: |
+          dotnet publish ./v2rayN.csproj \
+            -c Release \
+            -r win-x64 \
+            -p:SelfContained=true \
+            -p:EnableWindowsTargeting=true \
+            -o "${GITHUB_WORKSPACE}/PattN-windows-64"
+
+      - name: Remove Debug Symbols
+        shell: bash
+        run: |
+          find "${GITHUB_WORKSPACE}/PattN-windows-64" -type f \( -name '*.pdb' -o -name '*.debug' -o -name '*.dbg' -o -name '*.sym' \) -delete
+          find "${GITHUB_WORKSPACE}/PattN-windows-64" -name '*.dSYM' -exec rm -rf {} + 2>/dev/null || true
+
+      - name: Bundle v2rayN-core-bin
+        shell: bash
+        run: |
+          curl -sSL -o core-bin.zip "https://github.com/2dust/v2rayN-core-bin/raw/refs/heads/master/v2rayN-windows-64.zip"
+          7z x -y core-bin.zip
+          cp -an v2rayN-windows-64/. "PattN-windows-64/"
+          rm -rf core-bin.zip v2rayN-windows-64
+
+      - name: Bundle patterniha/Xray-core
+        shell: bash
+        run: |
+          curl -sSL -o xray-core.zip "https://github.com/patterniha/Xray-core/releases/latest/download/Xray-windows-64.zip"
+          7z x -y -oxray-core xray-core.zip
+          mkdir -p "PattN-windows-64/bin/xray"
+          cp -f xray-core/xray* "PattN-windows-64/bin/xray/"
+          rm -rf xray-core.zip xray-core
+
+      - name: Download Aether Binaries
+        uses: actions/download-artifact@v4
+        with:
+          name: aether-windows-bin
+          path: aether-extracted
+
+      - name: Bundle Aether and Psiphon Server List
+        shell: bash
+        run: |
+          mkdir -p "PattN-windows-64/bin"
+          cp -rn aether-extracted/bin/* "PattN-windows-64/bin/"
+          
+          url=$(grep -o 'PsiphonServersUrl = "[^"]*"' v2rayN/ServiceLib/Global.cs | cut -d'"' -f2)
+          if [ -n "$url" ]; then
+            curl -sSL -D psiphon.headers -o "PattN-windows-64/bin/psiphon_servers.dat" "$url" || true
+            published=$(grep -i '^last-modified:' psiphon.headers | cut -d: -f2- | xargs -I {} date -d "{}" +%s 2>/dev/null || date +%s)
+            echo "$published" > "PattN-windows-64/bin/psiphon_servers.stamp"
+            rm -f psiphon.headers
+          fi
+
+      - name: Bundle Chocolate4U and Sing-box geo files
+        shell: bash
+        run: |
+          curl -sSL -o "PattN-windows-64/bin/geosite.dat" "https://github.com/Chocolate4U/Iran-v2ray-rules/releases/latest/download/geosite.dat"
+          curl -sSL -o "PattN-windows-64/bin/geoip.dat" "https://github.com/Chocolate4U/Iran-v2ray-rules/releases/latest/download/geoip.dat"
+          mkdir -p "PattN-windows-64/bin/srss"
+          curl -sSL -o "PattN-windows-64/bin/srss/geosite-category-ir.srs" "https://raw.githubusercontent.com/chocolate4u/Iran-sing-box-rules/rule-set/geosite-category-ir.srs"
+          curl -sSL -o "PattN-windows-64/bin/srss/geoip-ir.srs" "https://raw.githubusercontent.com/chocolate4u/Iran-sing-box-rules/rule-set/geoip-ir.srs"
+
+      - name: Create Zip Package
+        shell: bash
+        run: |
+          7z a -tZip "PattN-windows-64.zip" "PattN-windows-64" -mx1
+
+      - name: Publish to GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: latest
+          name: "Latest Automated Build (Windows x64)"
+          body: |
+            نسخه کامپایل‌شده خودکار:
+            - **PattN**: [patterniha/PattN](https://github.com/patterniha/PattN)
+            - **Aether Core**: کامپایل مستقیم از سورس [patterniha/Aether](https://github.com/patterniha/Aether)
+          files: PattN-windows-64.zip
+          prerelease: false
+          make_latest: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
